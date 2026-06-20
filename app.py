@@ -5,6 +5,7 @@ import akshare as ak
 from datetime import datetime
 import time
 import random
+import traceback
 
 st.set_page_config(page_title="LOF溢价监控", layout="wide")
 st.title("📈 LOF 实时溢价监控（数据源：集思录）")
@@ -38,57 +39,64 @@ JSL_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# ---------- 获取集思录 LOF 数据 ----------
-@st.cache_data(ttl=30)
+# ---------- 获取集思录 LOF 数据（抛出异常，不吞错）----------
 def fetch_jsl_lof():
+    # 尝试多种可能的请求方式
     try:
-        resp = scraper.get(JSL_URL, headers=JSL_HEADERS, timeout=20)
-        if resp.status_code != 200:
-            st.error(f"集思录请求失败，状态码：{resp.status_code}")
-            return pd.DataFrame()
-        data = resp.json()
-        rows = data.get("rows", [])
-        if not rows:
-            st.error("集思录返回空数据")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(rows)
-        # 先提取原始字段
-        keep_cols = {
-            "fund_id": "代码",
-            "fund_nm": "简称",
-            "price": "最新价",
-            "estimate_value": "IOPV",      # 集思录的估算净值即为 IOPV
-            "discount_rt": "溢价率(%)",    # 已为百分比
-            "increase_rt": "涨跌幅",       # 涨跌幅，单位 %
-            "volume": "成交量",            # 单位：手
-            "amount": "成交额(元)",         # 单位：元
-            "turnover_rt": "换手率(%)",    # 单位 %
-        }
-        # 只保留存在的列
-        available = {k: v for k, v in keep_cols.items() if k in df.columns}
-        df = df[list(available.keys())].rename(columns=available)
-
-        # 转换数值（直接使用新列名）
-        for col in ["最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(元)", "换手率(%)"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # 计算成交额(万元)
-        if "成交额(元)" in df.columns:
-            df["成交额(万元)"] = (df["成交额(元)"] / 10000).round(0)
-            df = df.drop(columns=["成交额(元)"])  # 去掉原始元单位
-
-        # 保留最终需要的列
-        final_cols = ["代码", "简称", "最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(万元)", "换手率(%)"]
-        df = df[[c for c in final_cols if c in df.columns]]
-        return df
+        # 加上时间戳避免缓存
+        url = JSL_URL + f"?___t={int(time.time() * 1000)}"
+        resp = scraper.get(url, headers=JSL_HEADERS, timeout=20)
     except Exception as e:
-        st.error(f"获取集思录数据异常: {e}")
-        return pd.DataFrame()
+        raise Exception(f"网络请求失败: {str(e)}")
+
+    if resp.status_code != 200:
+        raise Exception(f"集思录返回状态码 {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise Exception(f"解析JSON失败: {str(e)}")
+
+    rows = data.get("rows", [])
+    if not rows:
+        raise Exception("集思录返回rows为空，可能接口有变化或需要登录")
+
+    df = pd.DataFrame(rows)
+    # 字段映射
+    keep_cols = {
+        "fund_id": "代码",
+        "fund_nm": "简称",
+        "price": "最新价",
+        "estimate_value": "IOPV",
+        "discount_rt": "溢价率(%)",
+        "increase_rt": "涨跌幅",
+        "volume": "成交量",
+        "amount": "成交额(元)",
+        "turnover_rt": "换手率(%)",
+    }
+    # 只保留存在的列
+    available = {k: v for k, v in keep_cols.items() if k in df.columns}
+    if not available:
+        raise Exception(f"接口字段不匹配，现有列: {df.columns.tolist()}")
+    df = df[list(available.keys())].rename(columns=available)
+
+    # 数值转换
+    numeric_cols = ["最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(元)", "换手率(%)"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 成交额转万元
+    if "成交额(元)" in df.columns:
+        df["成交额(万元)"] = (df["成交额(元)"] / 10000).round(0)
+        df = df.drop(columns=["成交额(元)"])
+
+    # 最终列
+    final_cols = ["代码", "简称", "最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(万元)", "换手率(%)"]
+    df = df[[c for c in final_cols if c in df.columns]]
+    return df
 
 # ---------- 获取申购状态（akshare）----------
-@st.cache_data(ttl=3600)
 def fetch_purchase_status():
     try:
         df = ak.fund_purchase_em()
@@ -101,23 +109,26 @@ def fetch_purchase_status():
 placeholder = st.empty()
 
 while True:
+    error_msg = None
     try:
         df = fetch_jsl_lof()
-        if not df.empty:
-            # 合并申购状态
-            status_df = fetch_purchase_status()
-            if not status_df.empty:
-                df = df.merge(status_df, on="代码", how="left")
-            else:
-                df["申购状态"] = "未知"
-            df["申购状态"] = df["申购状态"].fillna("未知")
-            st.session_state.cache = df
-            st.session_state.cache_time = datetime.now().strftime("%H:%M:%S")
-            error = False
+        if df.empty:
+            error_msg = "集思录返回数据为空，可能尚未收盘或接口变动"
+            raise Exception(error_msg)
+
+        # 合并申购状态
+        status_df = fetch_purchase_status()
+        if not status_df.empty:
+            df = df.merge(status_df, on="代码", how="left")
         else:
-            df = st.session_state.cache
-            error = True
-    except:
+            df["申购状态"] = "未知"
+        df["申购状态"] = df["申购状态"].fillna("未知")
+
+        st.session_state.cache = df
+        st.session_state.cache_time = datetime.now().strftime("%H:%M:%S")
+        error = False
+    except Exception as e:
+        error_msg = f"实时获取失败: {str(e)}"
         df = st.session_state.cache
         error = True
 
@@ -125,11 +136,14 @@ while True:
         col1, col2, col3 = st.columns(3)
         col1.metric("数据时间", st.session_state.cache_time)
         col2.metric("LOF数量", len(df))
-        if not df.empty:
+        if not df.empty and "溢价率(%)" in df.columns:
             col3.metric("最高溢价", f"{df['溢价率(%)'].max():.2f}%")
 
+        # 显示具体错误
+        if error_msg:
+            st.error(error_msg)
         if error:
-            st.warning("⚠️ 实时获取失败，显示缓存数据")
+            st.warning("⚠️ 显示的是缓存数据")
 
         if df.empty:
             st.info("暂无数据")
