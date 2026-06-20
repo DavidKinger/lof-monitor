@@ -4,6 +4,14 @@ import cloudscraper
 from datetime import datetime, time
 import time as _time
 import random
+import traceback
+
+# 尝试导入 curl_cffi 作为备选
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
 
 st.set_page_config(page_title="LOF溢价监控", layout="wide")
 st.title("📈 LOF 实时溢价监控")
@@ -36,16 +44,43 @@ if "cache" not in st.session_state:
 if "nav_cache" not in st.session_state:
     st.session_state.nav_cache = {}
 
-# ---------- 创建 cloudscraper 会话 ----------
+# ---------- 请求引擎 ----------
 scraper = cloudscraper.create_scraper(
     browser={
         'browser': 'chrome',
         'platform': 'windows',
         'mobile': False
-    }
+    },
+    delay=10  # 延迟10秒模拟人类行为
 )
 
-# ---------- 获取 LOF 行情（使用 cloudscraper）----------
+# ---------- 通用请求函数（cloudscraper + curl_cffi 双引擎）----------
+def safe_request(url, params=None, headers=None, timeout=20):
+    """先尝试 cloudscraper，失败则尝试 curl_cffi"""
+    errors = []
+    # 引擎1：cloudscraper
+    try:
+        resp = scraper.get(url, params=params, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            return resp
+        errors.append(f"cloudscraper 状态码 {resp.status_code}")
+    except Exception as e:
+        errors.append(f"cloudscraper 异常: {type(e).__name__}: {e}")
+
+    # 引擎2：curl_cffi (如果可用)
+    if HAS_CURL_CFFI:
+        try:
+            resp = curl_requests.get(url, params=params, headers=headers,
+                                     impersonate="chrome131", timeout=timeout)
+            if resp.status_code == 200:
+                return resp
+            errors.append(f"curl_cffi 状态码 {resp.status_code}")
+        except Exception as e:
+            errors.append(f"curl_cffi 异常: {type(e).__name__}: {e}")
+
+    raise ConnectionError(f"所有引擎均失败: {'; '.join(errors)}")
+
+# ---------- 获取 LOF 行情 ----------
 @st.cache_data(ttl=30)
 def fetch_lof_list():
     url = "https://push2.eastmoney.com/api/qt/clist/get"
@@ -61,11 +96,17 @@ def fetch_lof_list():
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
     try:
-        resp = scraper.get(url, params=params, headers=headers, timeout=20)
+        resp = safe_request(url, params=params, headers=headers, timeout=30)
         data = resp.json()
         if not data.get("data") or not data["data"].get("diff"):
+            st.error("接口返回空数据")
             return pd.DataFrame()
         raw = data["data"]["diff"]
         if isinstance(raw, dict):
@@ -85,10 +126,11 @@ def fetch_lof_list():
         if "成交额(元)" in df.columns:
             df["成交额(万元)"] = (pd.to_numeric(df["成交额(元)"], errors="coerce") / 10000).round(0)
         return df
-    except Exception:
+    except Exception as e:
+        st.error(f"获取行情失败: {e}")
         return pd.DataFrame()
 
-# ---------- 获取最新基金净值（cloudscraper）----------
+# ---------- 获取最新基金净值 ----------
 def fetch_latest_nav(code):
     if code in st.session_state.nav_cache:
         return st.session_state.nav_cache[code]
@@ -96,25 +138,25 @@ def fetch_latest_nav(code):
         url = "https://api.fund.eastmoney.com/f10/lsjz"
         params = {"fundCode": code, "pageIndex": 1, "pageSize": 1}
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0",
             "Referer": "https://fundf10.eastmoney.com/",
         }
-        resp = scraper.get(url, params=params, headers=headers, timeout=10)
+        resp = safe_request(url, params=params, headers=headers, timeout=10)
         data = resp.json()
         if data.get("Data") and data["Data"].get("LSJZList"):
             nav = float(data["Data"]["LSJZList"][0]["DWJZ"])
             st.session_state.nav_cache[code] = nav
             return nav
-    except:
+    except Exception as e:
         pass
     return None
 
-# ---------- 申购状态（cloudscraper）----------
+# ---------- 申购状态 ----------
 def fetch_status():
     try:
         url = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNNGSGStatus"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0",
             "Referer": "https://m.fund.eastmoney.com/",
         }
         params = {
@@ -123,7 +165,7 @@ def fetch_status():
             "product": "EFund", "ServerIndex": "FundMNNGSGStatus",
             "appType": "android", "appVersion": "6.8.0"
         }
-        resp = scraper.get(url, params=params, headers=headers, timeout=15)
+        resp = safe_request(url, params=params, headers=headers, timeout=15)
         data = resp.json()
         if data.get("Data"):
             rows = []
@@ -144,7 +186,7 @@ while True:
     try:
         df = fetch_lof_list()
         if df.empty:
-            raise Exception("empty")
+            raise ValueError("行情数据为空")
         if trading:
             df = df.dropna(subset=["最新价", "IOPV"])
             df = df[df["IOPV"] > 0]
@@ -182,7 +224,6 @@ while True:
         df["申购状态"] = "未知"
     df["申购状态"] = df["申购状态"].fillna("未知")
 
-    # 渲染
     with placeholder.container():
         col1, col2, col3 = st.columns(3)
         col1.metric("数据时间", st.session_state.cache_time)
@@ -193,7 +234,7 @@ while True:
         if trading:
             st.success("🟢 实时 IOPV 溢价率")
         else:
-            st.info("💡 当前非交易时段，使用最新基金净值计算溢价，仅供参考")
+            st.info("💡 非交易时段，使用最新基金净值")
         if error:
             st.warning("⚠️ 实时获取失败，显示缓存数据")
 
