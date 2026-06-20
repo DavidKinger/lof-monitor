@@ -5,7 +5,6 @@ import akshare as ak
 from datetime import datetime
 import time
 import random
-import json
 
 st.set_page_config(page_title="LOF溢价监控", layout="wide")
 st.title("📈 LOF 实时溢价监控（数据源：集思录）")
@@ -54,31 +53,35 @@ def fetch_jsl_lof():
             return pd.DataFrame()
 
         df = pd.DataFrame(rows)
-        # 提取字段映射
-        col_map = {
+        # 先提取原始字段
+        keep_cols = {
             "fund_id": "代码",
             "fund_nm": "简称",
             "price": "最新价",
             "estimate_value": "IOPV",      # 集思录的估算净值即为 IOPV
-            "discount_rt": "溢价率(%)",    # 已为百分比，无需再算
+            "discount_rt": "溢价率(%)",    # 已为百分比
             "increase_rt": "涨跌幅",       # 涨跌幅，单位 %
             "volume": "成交量",            # 单位：手
             "amount": "成交额(元)",         # 单位：元
             "turnover_rt": "换手率(%)",    # 单位 %
         }
-        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-        # 数值转换
-        df["最新价"] = pd.to_numeric(df["price"], errors="coerce")
-        df["IOPV"] = pd.to_numeric(df["IOPV"], errors="coerce")
-        df["溢价率(%)"] = pd.to_numeric(df["溢价率(%)"], errors="coerce")
-        df["涨跌幅"] = pd.to_numeric(df["涨跌幅"], errors="coerce")
-        df["成交量"] = pd.to_numeric(df["成交量"], errors="coerce")
-        df["成交额(元)"] = pd.to_numeric(df["成交额(元)"], errors="coerce")
-        df["换手率(%)"] = pd.to_numeric(df["换手率(%)"], errors="coerce")
+        # 只保留存在的列
+        available = {k: v for k, v in keep_cols.items() if k in df.columns}
+        df = df[list(available.keys())].rename(columns=available)
+
+        # 转换数值（直接使用新列名）
+        for col in ["最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(元)", "换手率(%)"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
         # 计算成交额(万元)
-        df["成交额(万元)"] = (df["成交额(元)"] / 10000).round(0)
-        # 只保留需要的列
-        df = df[["代码", "简称", "最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(万元)", "换手率(%)"]]
+        if "成交额(元)" in df.columns:
+            df["成交额(万元)"] = (df["成交额(元)"] / 10000).round(0)
+            df = df.drop(columns=["成交额(元)"])  # 去掉原始元单位
+
+        # 保留最终需要的列
+        final_cols = ["代码", "简称", "最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(万元)", "换手率(%)"]
+        df = df[[c for c in final_cols if c in df.columns]]
         return df
     except Exception as e:
         st.error(f"获取集思录数据异常: {e}")
