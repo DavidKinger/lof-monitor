@@ -5,7 +5,6 @@ import akshare as ak
 from datetime import datetime
 import time
 import random
-import traceback
 
 st.set_page_config(page_title="LOF溢价监控", layout="wide")
 st.title("📈 LOF 实时溢价监控（数据源：集思录）")
@@ -39,11 +38,9 @@ JSL_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# ---------- 获取集思录 LOF 数据（抛出异常，不吞错）----------
+# ---------- 获取集思录 LOF 数据 ----------
 def fetch_jsl_lof():
-    # 尝试多种可能的请求方式
     try:
-        # 加上时间戳避免缓存
         url = JSL_URL + f"?___t={int(time.time() * 1000)}"
         resp = scraper.get(url, headers=JSL_HEADERS, timeout=20)
     except Exception as e:
@@ -59,26 +56,42 @@ def fetch_jsl_lof():
 
     rows = data.get("rows", [])
     if not rows:
-        raise Exception("集思录返回rows为空，可能接口有变化或需要登录")
+        raise Exception("集思录返回rows为空，可能非交易时段或接口变动")
 
-    df = pd.DataFrame(rows)
-    # 字段映射
-    keep_cols = {
-        "fund_id": "代码",
-        "fund_nm": "简称",
-        "price": "最新价",
-        "estimate_value": "IOPV",
-        "discount_rt": "溢价率(%)",
-        "increase_rt": "涨跌幅",
-        "volume": "成交量",
-        "amount": "成交额(元)",
-        "turnover_rt": "换手率(%)",
-    }
-    # 只保留存在的列
-    available = {k: v for k, v in keep_cols.items() if k in df.columns}
-    if not available:
-        raise Exception(f"接口字段不匹配，现有列: {df.columns.tolist()}")
-    df = df[list(available.keys())].rename(columns=available)
+    # 检查是否是 DataTables 格式
+    if rows and "cell" in rows[0]:
+        # DataTables 格式：每行有 id 和 cell 数组
+        # 根据集思录的列定义：基金代码, 基金简称, 现价, 估算净值(IOPV), 溢价率, 涨幅, 成交量(手), 成交额(元), 换手率
+        # 实际顺序请参考返回数据，这里按常见顺序定义
+        col_names = ["代码", "简称", "最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(元)", "换手率(%)"]
+        records = []
+        for row in rows:
+            cells = row.get("cell", [])
+            record = {}
+            for i, col in enumerate(col_names):
+                if i < len(cells):
+                    record[col] = cells[i]
+            records.append(record)
+        df = pd.DataFrame(records)
+    else:
+        # 已经是字典格式
+        df = pd.DataFrame(rows)
+        keep_cols = {
+            "fund_id": "代码",
+            "fund_nm": "简称",
+            "price": "最新价",
+            "estimate_value": "IOPV",
+            "discount_rt": "溢价率(%)",
+            "increase_rt": "涨跌幅",
+            "volume": "成交量",
+            "amount": "成交额(元)",
+            "turnover_rt": "换手率(%)",
+        }
+        available = {k: v for k, v in keep_cols.items() if k in df.columns}
+        if available:
+            df = df[list(available.keys())].rename(columns=available)
+        else:
+            raise Exception(f"未知数据格式，现有列: {df.columns.tolist()}")
 
     # 数值转换
     numeric_cols = ["最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(元)", "换手率(%)"]
@@ -91,7 +104,6 @@ def fetch_jsl_lof():
         df["成交额(万元)"] = (df["成交额(元)"] / 10000).round(0)
         df = df.drop(columns=["成交额(元)"])
 
-    # 最终列
     final_cols = ["代码", "简称", "最新价", "IOPV", "溢价率(%)", "涨跌幅", "成交量", "成交额(万元)", "换手率(%)"]
     df = df[[c for c in final_cols if c in df.columns]]
     return df
@@ -139,7 +151,6 @@ while True:
         if not df.empty and "溢价率(%)" in df.columns:
             col3.metric("最高溢价", f"{df['溢价率(%)'].max():.2f}%")
 
-        # 显示具体错误
         if error_msg:
             st.error(error_msg)
         if error:
