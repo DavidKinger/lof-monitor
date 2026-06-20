@@ -43,7 +43,6 @@ def get_status(premium_rate, discount_rate):
 
 @st.cache_data(ttl=600)
 def get_purchase_status_df():
-    """一次性获取全市场申购状态"""
     try:
         df = ak.fund_purchase_em()
         df = df.rename(columns={"基金代码": "code", "申购状态": "申购状态"})
@@ -54,21 +53,18 @@ def get_purchase_status_df():
 @st.cache_data(ttl=120)
 def load_data():
     msgs = []
-    # 1. 新浪 LOF 列表
     try:
         raw = ak.fund_etf_category_sina(symbol="LOF基金")
         msgs.append(f"新浪行情获取成功：{len(raw)} 条")
     except Exception as e:
         return None, [f"新浪行情获取失败: {e}"]
 
-    # 2. 天天基金净值
     try:
         nav_df = ak.fund_open_fund_daily_em()
         msgs.append(f"天天净值获取成功：{len(nav_df)} 条")
     except Exception as e:
         return None, [f"净值获取失败: {e}"]
 
-    # 3. 申购状态（全市场，一次搞定）
     status_df = get_purchase_status_df()
 
     records = []
@@ -102,7 +98,6 @@ def load_data():
             amount = None
         amount_wan = round(amount / 10000, 2) if amount else None
 
-        # 净值
         nav_row = nav_df[nav_df['基金代码'].astype(str) == str(code)]
         if nav_row.empty:
             continue
@@ -145,7 +140,6 @@ def load_data():
     df['溢价率(%)'] = premiums
     df['状态'] = statuses
 
-    # 合并申购状态
     if not status_df.empty:
         df['code'] = df['code'].astype(str)
         status_df['code'] = status_df['code'].astype(str)
@@ -155,6 +149,20 @@ def load_data():
     df['申购状态'] = df['申购状态'].fillna('未知')
 
     return df, msgs
+
+# ---------- 中文列名映射 ----------
+CN_COL_MAP = {
+    'code': '基金代码',
+    'name': '基金名称',
+    'market_price': '场内价格',
+    'nav_price': '基金净值',
+    '溢价率(%)': '溢价率(%)',
+    'change_pct': '涨跌幅(%)',
+    'volume': '成交量(手)',
+    'amount_wan': '成交额(万元)',
+    '申购状态': '申购状态',
+    '状态': '状态',
+}
 
 placeholder = st.empty()
 
@@ -182,6 +190,14 @@ while True:
 
             show = show.sort_values('溢价率(%)', ascending=False, na_position='last').head(top_n)
 
+            # 重命名为中文列名（只保留需要的列）
+            show = show.rename(columns=CN_COL_MAP)
+            display_cols = [
+                '基金代码', '基金名称', '场内价格', '基金净值', '溢价率(%)',
+                '涨跌幅(%)', '成交量(手)', '成交额(万元)', '申购状态', '状态'
+            ]
+            avail = [c for c in display_cols if c in show.columns]
+
             def color_status(val):
                 if val == 'premium_alert':
                     return 'background-color: #ffcccc; font-weight: bold'
@@ -193,20 +209,14 @@ while True:
                     return 'background-color: #e0ffe0'
                 return ''
 
-            display_cols = [
-                'code', 'name', 'market_price', 'nav_price', '溢价率(%)',
-                'change_pct', 'volume', 'amount_wan', '申购状态', '状态'
-            ]
-            avail = [c for c in display_cols if c in show.columns]
-
             styled = show[avail].style \
                 .format({
-                    'market_price': '{:.4f}',
-                    'nav_price': '{:.4f}',
+                    '场内价格': '{:.4f}',
+                    '基金净值': '{:.4f}',
                     '溢价率(%)': '{:+.2f}%',
-                    'change_pct': '{:+.2f}%',
-                    'volume': '{:,.0f}',
-                    'amount_wan': '{:,.2f}',
+                    '涨跌幅(%)': '{:+.2f}%',
+                    '成交量(手)': '{:,.0f}',
+                    '成交额(万元)': '{:,.2f}',
                 }, na_rep="N/A") \
                 .map(color_status, subset=['状态'])
 
