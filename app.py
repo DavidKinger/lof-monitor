@@ -5,31 +5,22 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import time
-import random
 
 st.set_page_config(page_title="LOF溢价监控", layout="wide")
-st.title("📈 LOF 溢价监控（新浪行情 + 天天基金净值）")
+st.title("📈 LOF 溢价监控")
 
 # ---------- 配置 ----------
-PREMIUM_THRESHOLD = 3.0      # 溢价告警阈值（%）
-DISCOUNT_THRESHOLD = 1.5     # 折价告警阈值（%）
+PREMIUM_THRESHOLD = 3.0
+DISCOUNT_THRESHOLD = 1.5
 
 # ---------- 侧边栏 ----------
 with st.sidebar:
-    st.header("⚙️ 设置")
+    st.header("设置")
     refresh_sec = st.number_input("刷新间隔（秒）", 10, 600, 30, 10)
     top_n = st.slider("显示前 N 只", 10, 100, 25, 5)
-    purchase_filter = st.radio("申购状态", ["全部", "仅开放申购", "仅暂停申购"], index=0)
-    manual_refresh = st.button("🔄 手动刷新")
-    st.divider()
-    st.info("💡 价格来自新浪 | 净值来自天天基金 | 交易状态来自东方财富")
+    manual_refresh = st.button("手动刷新")
 
-# ---------- 缓存 ----------
-if "cache" not in st.session_state:
-    st.session_state.cache = pd.DataFrame()
-    st.session_state.cache_time = "暂无"
-
-# ---------- 溢价/折价计算 ----------
+# ---------- 计算函数 ----------
 def calc_premium_discount(market_price, nav_price):
     if market_price is None or nav_price is None or market_price == 0 or nav_price == 0:
         return None, None
@@ -55,190 +46,112 @@ def get_status(premium_rate, discount_rate):
         return 'normal'
 
 # ---------- 数据获取 ----------
-@st.cache_data(ttl=60)
-def fetch_lof_list_sina():
-    """从新浪获取 LOF 基金列表及实时价格"""
-    try:
-        raw = ak.fund_etf_category_sina(symbol="LOF基金")
-        records = []
-        for _, row in raw.iterrows():
-            code_with = row['代码']
-            if code_with.startswith('sz'):
-                market = 'sz'
-                code = code_with[2:]
-            elif code_with.startswith('sh'):
-                market = 'sh'
-                code = code_with[2:]
-            else:
-                market = ''
-                code = code_with
-            try:
-                price = float(row['最新价']) if pd.notna(row['最新价']) else None
-            except (ValueError, TypeError):
-                price = None
-            records.append({
-                'code': code,
-                'name': row['名称'],
-                'market': market,
-                'market_price': price
-            })
-        df = pd.DataFrame(records)
-        df = df[df['market_price'].notna() & (df['market_price'] > 0)]
-        return df
-    except Exception as e:
-        st.error(f"获取LOF列表失败: {e}")
-        return pd.DataFrame()
-
 @st.cache_data(ttl=120)
-def fetch_all_fund_nav():
-    """获取全市场基金最新净值（天天基金）"""
+def load_data():
+    status_msg = []
+    try:
+        # 1. 新浪LOF列表
+        raw = ak.fund_etf_category_sina(symbol="LOF基金")
+        status_msg.append(f"新浪列表获取成功：{len(raw)} 条")
+    except Exception as e:
+        return None, [f"新浪列表获取失败: {e}"]
+
+    # 2. 天天基金净值
     try:
         nav_df = ak.fund_open_fund_daily_em()
-        return nav_df
+        status_msg.append(f"天天基金净值获取成功：{len(nav_df)} 条")
     except Exception as e:
-        st.error(f"获取净值数据失败: {e}")
-        return pd.DataFrame()
+        return None, [f"净值获取失败: {e}"]
 
-def get_latest_nav_value(fund_code, nav_df):
-    """从净值DataFrame中提取指定基金最新净值"""
-    row = nav_df[nav_df['基金代码'].astype(str) == str(fund_code)]
-    if row.empty:
-        return None, None
-    row_data = row.iloc[0]
-    nav_cols = [c for c in nav_df.columns if '单位净值' in c]
-    nav_cols.sort(reverse=True)
-    for col in nav_cols:
-        val = row_data[col]
-        if pd.notnull(val) and str(val).strip() not in ['', '-']:
-            try:
-                return float(val), col.split('-单位净值')[0]
-            except ValueError:
-                continue
-    return None, None
+    # 3. 合并
+    records = []
+    for _, row in raw.iterrows():
+        code_with = row['代码']
+        if code_with.startswith('sz'):
+            code = code_with[2:]
+        elif code_with.startswith('sh'):
+            code = code_with[2:]
+        else:
+            code = code_with
 
-def parse_trade_state(code):
-    """从东方财富页面获取交易状态"""
-    try:
-        url = f"https://fund.eastmoney.com/{code}.html"
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        resp.encoding = resp.apparent_encoding
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            for item in soup.find_all("div", class_="staticItem"):
-                if "交易状态" in item.text:
-                    return item.get_text(strip=True).replace("交易状态：", "")
-    except:
-        pass
-    return "未知"
+        try:
+            price = float(row['最新价']) if pd.notna(row['最新价']) else None
+        except (ValueError, TypeError):
+            price = None
+        if price is None or price <= 0:
+            continue
 
-# ---------- 主循环 ----------
+        # 从净值表取最新净值
+        nav_row = nav_df[nav_df['基金代码'].astype(str) == str(code)]
+        if nav_row.empty:
+            continue
+        nav_data = nav_row.iloc[0]
+        nav_cols = [c for c in nav_df.columns if '单位净值' in c]
+        nav_cols.sort(reverse=True)
+        nav_price = None
+        for col in nav_cols:
+            val = nav_data[col]
+            if pd.notnull(val) and str(val).strip() not in ['', '-']:
+                try:
+                    nav_price = float(val)
+                    break
+                except ValueError:
+                    continue
+        if nav_price is None:
+            continue
+
+        records.append({
+            'code': code,
+            'name': row['名称'],
+            'market_price': price,
+            'nav_price': nav_price,
+        })
+
+    if not records:
+        return None, status_msg + ["合并后无有效数据（所有基金均无净值）"]
+
+    df = pd.DataFrame(records)
+    # 计算溢价/折价
+    premiums, discounts, statuses = [], [], []
+    for _, r in df.iterrows():
+        p, d = calc_premium_discount(r['market_price'], r['nav_price'])
+        premiums.append(p)
+        discounts.append(d)
+        statuses.append(get_status(p, d))
+    df['溢价率(%)'] = premiums
+    df['折价率(%)'] = discounts
+    df['状态'] = statuses
+
+    # 申购状态（简化，只取部分样本避免太慢）
+    # 若需要可后续扩展，这里先填未知
+    df['申购状态'] = '未知'
+
+    return df, status_msg
+
+# ---------- 主界面 ----------
 placeholder = st.empty()
 
 while True:
-    start_time = time.time()
-    try:
-        # 获取行情列表
-        fund_df = fetch_lof_list_sina()
-        if fund_df.empty:
-            raise Exception("LOF列表为空")
-
-        # 获取净值
-        nav_df = fetch_all_fund_nav()
-        if nav_df.empty:
-            raise Exception("净值数据为空")
-
-        # 筛选有效代码
-        valid_codes = set(fund_df['code'].astype(str))
-        nav_df = nav_df[nav_df['基金代码'].astype(str).isin(valid_codes)]
-
-        # 合并数据
-        data = []
-        for _, row in fund_df.iterrows():
-            code = row['code']
-            name = row['name']
-            market_price = row['market_price']
-            nav_price, nav_date = get_latest_nav_value(code, nav_df)
-            if nav_price is None:
-                continue
-            data.append({
-                'code': code,
-                'name': name,
-                'market_price': market_price,
-                'nav_price': nav_price,
-                'nav_date': nav_date or '--',
-            })
-
-        df = pd.DataFrame(data)
-        if df.empty:
-            raise Exception("没有有效的净值数据")
-
-        # 计算溢价/折价
-        premiums, discounts, statuses = [], [], []
-        for _, r in df.iterrows():
-            p, d = calc_premium_discount(r['market_price'], r['nav_price'])
-            premiums.append(p)
-            discounts.append(d)
-            statuses.append(get_status(p, d))
-        df['溢价率(%)'] = premiums
-        df['折价率(%)'] = discounts
-        df['状态'] = statuses
-
-        # 获取交易状态（分批，避免请求太快）
-        states = {}
-        for code in df['code'].unique():
-            states[code] = parse_trade_state(code)
-            time.sleep(0.2)
-        df['申购状态'] = df['code'].map(states)
-
-        # 缓存
-        st.session_state.cache = df
-        st.session_state.cache_time = datetime.now().strftime("%H:%M:%S")
-        error = False
-
-    except Exception as e:
-        st.error(f"数据获取异常: {e}")
-        df = st.session_state.cache
-        error = True
-
-    # 渲染
+    df, msgs = load_data()
     with placeholder.container():
-        col1, col2, col3 = st.columns(3)
-        col1.metric("数据时间", st.session_state.cache_time)
-        col2.metric("LOF数量", len(df))
-        if not df.empty:
+        st.write("数据加载状态：")
+        for m in msgs:
+            st.write(f"- {m}")
+
+        if df is None or df.empty:
+            st.error("无法获取有效数据，请检查网络或稍后再试。")
+        else:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("LOF数量", len(df))
             max_prem = df['溢价率(%)'].max()
             max_disc = df['折价率(%)'].max()
             if pd.notna(max_prem):
-                col3.metric("最高溢价", f"{max_prem:.2f}%")
-            elif pd.notna(max_disc):
+                col2.metric("最高溢价", f"{max_prem:.2f}%")
+            if pd.notna(max_disc):
                 col3.metric("最高折价", f"{max_disc:.2f}%")
-            else:
-                col3.metric("最高溢价", "0%")
-
-        if error:
-            st.warning("⚠️ 显示的是缓存数据")
-
-        if df.empty:
-            st.info("暂无数据")
-        else:
-            # 筛选申购状态
-            if purchase_filter == "仅开放申购":
-                show = df[df["申购状态"].str.contains("开放", na=False)]
-            elif purchase_filter == "仅暂停申购":
-                show = df[df["申购状态"].str.contains("暂停", na=False)]
-            else:
-                show = df
 
             # 排序
-            sort_col = "溢价率(%)" if show["溢价率(%)"].notna().any() else "折价率(%)"
-            show = show.sort_values(sort_col, ascending=False, na_position='last').head(top_n)
-
-            # 列定义
-            cols = [
-                "code", "name", "market_price", "nav_price", "溢价率(%)", "折价率(%)",
-                "状态", "申购状态"
-            ]
-            avail = [c for c in cols if c in show.columns]
+            show = df.sort_values('溢价率(%)', ascending=False, na_position='last').head(top_n)
 
             # 状态颜色
             def color_status(val):
@@ -252,20 +165,17 @@ while True:
                     return 'background-color: #e0ffe0'
                 return ''
 
-            formatted = show[avail].style.format({
-                "market_price": "{:.4f}",
-                "nav_price": "{:.4f}",
-                "溢价率(%)": "{:+.2f}%",
-                "折价率(%)": "{:+.2f}%",
-            }, na_rep="N/A").applymap(color_status, subset=["状态"])
-
-            st.dataframe(formatted, use_container_width=True, height=600, hide_index=True)
+            styled = show[['code','name','market_price','nav_price','溢价率(%)','折价率(%)','状态']].style \
+                .format({
+                    'market_price': '{:.4f}',
+                    'nav_price': '{:.4f}',
+                    '溢价率(%)': '{:+.2f}%',
+                    '折价率(%)': '{:+.2f}%',
+                }, na_rep="N/A") \
+                .applymap(color_status, subset=['状态'])
+            st.dataframe(styled, use_container_width=True, height=600, hide_index=True)
 
     if manual_refresh:
         st.rerun()
-
-    # 等待下次刷新
-    elapsed = time.time() - start_time
-    sleep_time = max(1, refresh_sec - elapsed)
-    time.sleep(sleep_time)
+    time.sleep(max(5, refresh_sec))
     st.rerun()
